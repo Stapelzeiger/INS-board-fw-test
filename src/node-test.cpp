@@ -8,14 +8,28 @@
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/rcc.h>
 
-#include <uavcan/protocol/NodeStatus.hpp>
-#include <uavcan/protocol/debug/KeyValue.hpp>
+#include <uavcan/cvra/CVRAService.hpp>
+#include <uavcan/cvra/CVRAService2.hpp>
+#include <uavcan/cvra/CVRAService3.hpp>
+#include <platform-abstraction/timestamp.h>
+#include <src/ins-board.h>
 
 #include <stdarg.h>
 
-#define NODE_ID 42
-#define NODE_NAME "node-test-1"
 #define CAN_BITRATE 1000000
+
+#define NODE_SERVER 1
+
+#define SERVER_NODE_ID 42
+#define CLIENT_NODE_ID 23
+
+#if NODE_SERVER
+# define NODE_ID SERVER_NODE_ID
+# define NODE_NAME "server"
+#else
+# define NODE_ID CLIENT_NODE_ID
+# define NODE_NAME "client"
+#endif
 
 uavcan_stm32::CanInitHelper<128> can;
 
@@ -41,46 +55,85 @@ void can2_gpio_init(void)
     gpio_mode_setup(GPIOB, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO12 | GPIO13);
 }
 
-void key_value_cb(const uavcan::ReceivedDataStructure<uavcan::protocol::debug::KeyValue>& msg)
-{
-    const uint8_t *m = &msg.key[0];
-    std::printf("KeyValue:%d: %s\n", msg.getSrcNodeID().get(), m);
-}
+#if NODE_SERVER
 
-void node_status_cb(const uavcan::ReceivedDataStructure<uavcan::protocol::NodeStatus>& msg)
+void trace_request(void)
 {
-    const uint8_t st = msg.status_code;
-    const char *st_name;
-    switch (st) {
-        case 0:
-            st_name = "STATUS_OK";
-            break;
-        case 1:
-            st_name = "STATUS_INITIALIZING";
-            break;
-        case 2:
-            st_name = "STATUS_WARNING";
-            break;
-        case 3:
-            st_name = "STATUS_CRITICAL";
-            break;
-        case 15:
-            st_name = "STATUS_OFFLINE";
-            break;
-        default:
-            st_name = "UNKNOWN_STATUS";
-            break;
+    static unsigned int request_counter = 0;
+    static uint32_t start = 0;
+
+    if (request_counter++ == 0) {
+        start = os_timestamp_get();
+    } else if (os_timestamp_get() - start > 1000000) {
+        printf("req/sec: %u\n",  request_counter);
+        request_counter = 0;
     }
-    std::printf("NodeStatus from %d: %u (%s)\n", msg.getSrcNodeID().get(), st, st_name);
+    STATUS_LED_TOGGLE();
 }
 
-void log_cub_cb(const uavcan::ReceivedDataStructure<uavcan::protocol::debug::LogMessage>& msg)
+void cvra_server_cb(const uavcan::ReceivedDataStructure<uavcan::cvra::CVRAService::Request>& req,
+                    uavcan::cvra::CVRAService::Response& rsp)
 {
-    const uint8_t *s = &msg.source[0];
-    const uint8_t *m = &msg.text[0];
-    const uint8_t l = msg.level.value;
-    std::printf("LogMessage:%d: %s:%s, level: %d\n", msg.getSrcNodeID().get(), s, m, l);
+    trace_request();
+    const uint32_t d = req.request_data;
+    rsp.response_data = d;
 }
+
+void cvra_server_cb2(const uavcan::ReceivedDataStructure<uavcan::cvra::CVRAService2::Request>& req,
+                    uavcan::cvra::CVRAService2::Response& rsp)
+{
+    trace_request();
+    const uint32_t d = req.request_data;
+    rsp.response_data = d;
+}
+
+void cvra_server_cb3(const uavcan::ReceivedDataStructure<uavcan::cvra::CVRAService3::Request>& req,
+                    uavcan::cvra::CVRAService3::Response& rsp)
+{
+    trace_request();
+    const uint32_t d = req.request_data;
+    rsp.response_data = d;
+}
+#else
+
+uint32_t trace(bool start)
+{
+    uint32_t diff = 0;
+    static int print = 100;
+    static uint32_t start_ts;
+    if (start) {
+        start_ts = os_timestamp_get();
+    } else {
+        diff = os_timestamp_get() - start_ts;
+        if (print-- == 0) {
+            printf("trace: %u usec\n", (unsigned int) diff);
+            print = 100;
+        }
+    }
+    return diff;
+}
+
+void cvra_client_cb(const uavcan::ServiceCallResult<uavcan::cvra::CVRAService>& call_result)
+{
+    // trace(false);
+    const uint32_t resp = call_result.response.response_data;
+    if (resp == 42) {
+        STATUS_LED_TOGGLE();
+    } else {
+        ERROR_LED_TOGGLE();
+    }
+}
+
+void cvra_client_cb2(const uavcan::ServiceCallResult<uavcan::cvra::CVRAService2>& call_result)
+{
+
+}
+
+void cvra_client_cb3(const uavcan::ServiceCallResult<uavcan::cvra::CVRAService3>& call_result)
+{
+
+}
+#endif
 
 void cpp_node_main(void)
 {
@@ -121,48 +174,45 @@ void cpp_node_main(void)
         os_thread_sleep_us(1000);
     }
 
-    uavcan::Publisher<uavcan::protocol::debug::KeyValue> kv_pub(node);
-    const int kv_pub_init_res = kv_pub.init();
-    if (kv_pub_init_res < 0) {
-        std::printf("error KeyValue publisher init");
-        while (1);
+#if NODE_SERVER
+    /* CVRAService server */
+    std::printf("config CVRAService server\n");
+
+    uavcan::ServiceServer<uavcan::cvra::CVRAService> srv(node);
+    const int srv_start_res = srv.start(cvra_server_cb);
+    if (srv_start_res < 0) {
+        std::printf("failed to start CVRAService server\n");
+        while(1) {
+            os_thread_sleep_us(1000);
+        }
+    }
+    uavcan::ServiceServer<uavcan::cvra::CVRAService2> srv2(node);
+    srv2.start(cvra_server_cb2);
+    uavcan::ServiceServer<uavcan::cvra::CVRAService3> srv3(node);
+    srv3.start(cvra_server_cb3);
+#else
+    /* CVRAService client */
+    std::printf("config CVRAService client\n");
+
+    uavcan::ServiceClient<uavcan::cvra::CVRAService> client(node);
+    const int client_init_res = client.init();
+    if (client_init_res < 0) {
+        std::printf("failed to start CVRAService client\n");
+        while(1) {
+            os_thread_sleep_us(1000);
+        }
     }
 
+    client.setCallback(cvra_client_cb);
 
-    uavcan::Subscriber<uavcan::protocol::debug::KeyValue> kv_sub(node);
+    uavcan::ServiceClient<uavcan::cvra::CVRAService2> client2(node);
+    client2.init();
+    client2.setCallback(cvra_client_cb2);
 
-    const int kv_sub_start_res = kv_sub.start(key_value_cb);
-
-    if (kv_sub_start_res < 0)
-    {
-        std::printf("error KeyValue subscriber init");
-        while (1);
-    }
-
-    /* node status subscriber */
-    uavcan::Subscriber<uavcan::protocol::NodeStatus> ns_sub(node);
-
-    const int ns_sub_start_res = ns_sub.start(node_status_cb);
-
-    if (ns_sub_start_res < 0)
-    {
-        std::printf("error NodeStatus subscriber init");
-        while (1);
-    }
-
-    /* log message subscriber */
-    uavcan::Subscriber<uavcan::protocol::debug::LogMessage> log_sub(node);
-
-    const int log_sub_start_res = log_sub.start(log_cub_cb);
-
-    if (log_sub_start_res < 0)
-    {
-        std::printf("error LogMessage subscriber init");
-        while (1);
-    }
-
-    /* logger */
-    node.getLogger().setLevel(uavcan::protocol::debug::LogLevel::DEBUG);
+    uavcan::ServiceClient<uavcan::cvra::CVRAService3> client3(node);
+    client3.init();
+    client3.setCallback(cvra_client_cb3);
+#endif
 
     /*
      * Informing other nodes that we're ready to work.
@@ -176,28 +226,47 @@ void cpp_node_main(void)
     std::printf("UAVCAN node started\n");
 
     while (true) {
-        /*
-         * Spinning for 1 second.
-         * The method spin() may return earlier if an error occurs (e.g. driver failure).
-         * All error codes are listed in the header uavcan/error.hpp.
-         */
+#if NODE_SERVER
         int spin_res = node.spin(uavcan::MonotonicDuration::fromMSec(1000));
-
         if (spin_res < 0) {
             std::printf("Spin failure: %i\n", spin_res);
         }
+#else
+        if (!client.isPending()) {
+            uavcan::cvra::CVRAService::Request req;
+            req.request_data = 42;
 
-        uavcan::protocol::debug::KeyValue kv_msg;  // Always zero initialized
-        kv_msg.type = kv_msg.TYPE_STRING;
-        kv_msg.key = NODE_NAME;
+            const int res = client.call(SERVER_NODE_ID, req);
 
-        const int pub_res = kv_pub.broadcast(kv_msg);
-        if (pub_res < 0)
-        {
-            std::printf("KV publication failure: %d\n", pub_res);
+            if (res < 0) {
+                printf("CVRAService request call failed\n");
+            }
+            // trace(true);
         }
 
-        node.logInfo("main", "Hello world!");
+        if (!client2.isPending()) {
+            uavcan::cvra::CVRAService2::Request req;
+            req.request_data = 42;
+            const int res = client2.call(SERVER_NODE_ID, req);
+            if (res < 0) {
+                printf("CVRAService request call failed\n");
+            }
+        }
+
+        if (!client3.isPending()) {
+            uavcan::cvra::CVRAService3::Request req;
+            req.request_data = 42;
+            const int res = client3.call(SERVER_NODE_ID, req);
+            if (res < 0) {
+                printf("CVRAService request call failed\n");
+            }
+        }
+
+        int spin_res = node.spin(uavcan::MonotonicDuration::fromMSec(0));
+        if (spin_res < 0) {
+            std::printf("Spin failure: %i\n", spin_res);
+        }
+#endif
 
         gpio_toggle(GPIOA, GPIO8);
     }
