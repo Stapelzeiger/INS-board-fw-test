@@ -175,18 +175,18 @@ parts of this code are from http://stm32discovery.nano-age.co.uk/open-source-dev
 // char *__env[1] = { 0 };
 // char **environ = __env;
 
-void _exit(int status) {
-    OS_ERR err;
-    /* NULL kills running task */
-    OSTaskDel((OS_TCB *)NULL, &err);
+// void _exit(int status) {
+//     OS_ERR err;
+//     /* NULL kills running task */
+//     OSTaskDel((OS_TCB *)NULL, &err);
 
-    if (err != OS_ERR_NONE) {
-        PANIC("exit from non-thread context");
-    }
+//     if (err != OS_ERR_NONE) {
+//         PANIC("exit from non-thread context");
+//     }
 
-    /* should not return */
-    while (1);
-}
+//     /* should not return */
+//     while (1);
+// }
 
 // /*
 //  execve
